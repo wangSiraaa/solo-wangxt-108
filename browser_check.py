@@ -291,13 +291,14 @@ def main():
         # ---------------- 5. 人工新增操作事件 ----------------
         # 选 kind=damper，填时间/档位/备注，点新增
         page.locator(".card .row").first.scroll_into_view_if_needed()
-        page.locator(".card .row select").first.select_option("damper")  # 事件编辑卡片内的新增下拉
-        page.fill(".row input[placeholder='时间 s']", "430")
-        page.fill(".row input[placeholder='档位 0-100']", "65")
-        page.fill(".row input[placeholder='备注']", "浏览器自动化新增风门")
+        ev_card = page.locator(".card", has_text="人工新增操作标记")
+        ev_card.locator(".row select").first.select_option("damper")
+        ev_card.locator(".row input[placeholder='时间 s']").fill("430")
+        ev_card.locator(".row input[placeholder='档位 0-100']").fill("65")
+        ev_card.locator(".row input[placeholder='备注']").fill("浏览器自动化新增风门")
         before = body.count("风门")
         reqs.clear()
-        page.click(".row button:has-text('新增')")
+        ev_card.locator(".row button:has-text('新增')").click()
         wait_req(reqs, "/api/events", "POST")
         wait_idle(page, 1500)
         body = page.inner_text("body")

@@ -80,6 +80,7 @@ def _build_detail(bid: int, params: ComputeParams) -> dict[str, Any]:
             "风门/燃气前后对比仅为描述性统计，不表示因果关系",
         ],
         "notes": services.list_notes(bid=bid),
+        "tags": services.list_tags(bid),
     }
 
 
@@ -398,6 +399,47 @@ def note_revisions(nid: int) -> list[dict[str, Any]]:
     return services.list_note_revisions(nid)
 
 
+# ---------------- 阶段复盘标签 ----------------
+
+class TagIn(BaseModel):
+    event_kind: str
+    label: str = Field(min_length=1)
+    description: str | None = None
+    created_by: str = "operator"
+
+
+@app.get("/api/batches/{bid}/tags")
+def list_tags(bid: int, event_kind: str | None = None) -> list[dict[str, Any]]:
+    if services.get_batch(bid) is None:
+        raise HTTPException(404, "批次不存在")
+    if event_kind is not None and event_kind not in analytics.THERMAL_KINDS + ("damper", "gas"):
+        raise HTTPException(422, "event_kind 非法")
+    return services.list_tags(bid, event_kind)
+
+
+@app.post("/api/batches/{bid}/tags")
+def create_tag(bid: int, body: TagIn) -> dict[str, Any]:
+    if services.get_batch(bid) is None:
+        raise HTTPException(404, "批次不存在")
+    try:
+        return services.create_tag(
+            bid, body.event_kind, body.label, body.description, body.created_by
+        )
+    except LookupError as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.delete("/api/batches/{bid}/tags/{tid}")
+def delete_tag(bid: int, tid: int) -> dict[str, Any]:
+    tag = next((t for t in services.list_tags(bid) if t["id"] == tid), None)
+    if tag is None:
+        raise HTTPException(404, "该批次下没有此标签")
+    services.delete_tag(tid)  # 仅删除标签，不影响事件/修订
+    return {"deleted": tid, "events_unchanged": True, "revisions_unchanged": True}
+
+
 @app.get("/api/batches/{bid}/export")
 def export_batch(
     bid: int, smooth_window_s: float | None = None, ror_window_s: float | None = None
@@ -439,6 +481,7 @@ def export_batch(
         "raw_samples": raw_serialized,
         "events_active": services.load_events(bid),
         "event_revisions": services.load_revisions(bid),
+        "event_tags": services.list_tags(bid),
         "derived": {
             "bean": detail["bean"],
             "env": detail["env"],

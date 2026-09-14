@@ -154,6 +154,23 @@ CREATE TABLE IF NOT EXISTS note_status_revisions (
     changed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_note_rev_note ON note_status_revisions(note_id);
+
+-- 阶段复盘标签：绑定到“创建时那个具体事件版本”，事件后续修正时旧标签仍保留原快照。
+CREATE TABLE IF NOT EXISTS event_tags (
+    id              BIGSERIAL PRIMARY KEY,
+    batch_id        BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    event_kind      TEXT NOT NULL CHECK
+                        (event_kind IN ('charge','turnaround','yellow','first_crack','drop','damper','gas')),
+    label           TEXT NOT NULL,
+    description     TEXT,
+    -- 创建时的事件版本快照
+    bound_event_id  BIGINT REFERENCES events(id) ON DELETE SET NULL,
+    event_t_s       DOUBLE PRECISION NOT NULL,   -- 标签创建时该事件的时间
+    event_source    TEXT NOT NULL,              -- 标签创建时该事件的来源(auto/manual)
+    created_by      TEXT NOT NULL DEFAULT 'operator',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tags_batch ON event_tags(batch_id, event_kind);
 """
 
 

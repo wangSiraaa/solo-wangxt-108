@@ -11,13 +11,13 @@ from .synth import build_profiles, generate_samples
 
 
 def reseed(seed: int = 7) -> dict[str, int]:
-    """删除旧数据并写入合成批次（原始采样 + auto 事件 + 两条对比备注）。幂等。"""
+    """删除旧数据并写入合成批次（采样 + 事件 + 对比备注 + 复盘标签）。幂等。"""
     profiles = build_profiles()
-    counts = {"batches": 0, "samples": 0, "events": 0, "notes": 0}
+    counts = {"batches": 0, "samples": 0, "events": 0, "notes": 0, "tags": 0}
     batch_ids: list[int] = []
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "TRUNCATE note_status_revisions, comparison_notes, comparison_reports,"
+            "TRUNCATE event_tags, note_status_revisions, comparison_notes, comparison_reports,"
             " event_candidates, event_revisions, events, samples, batches RESTART IDENTITY"
         )
         for pi, prof in enumerate(profiles):
@@ -136,6 +136,29 @@ def reseed(seed: int = 7) -> dict[str, int]:
                 (nid, sn["status"], sn["by"]),
             )
             counts["notes"] += 1
+
+        # 三条阶段复盘标签样例（批次1）：分别覆盖一爆、出豆、变黄，绑定创建时事件版本
+        def _seed_tag(cur, bid, kind, label, desc, by):
+            cur.execute(
+                "SELECT id, t_s, source FROM events WHERE batch_id=%s AND kind=%s"
+                " AND revoked_at IS NULL ORDER BY id DESC LIMIT 1",
+                (bid, kind),
+            )
+            ev = cur.fetchone()
+            cur.execute(
+                "INSERT INTO event_tags(batch_id, event_kind, label, description,"
+                " bound_event_id, event_t_s, event_source, created_by)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (bid, kind, label, desc, ev["id"], ev["t_s"], ev["source"], by),
+            )
+
+        for kind, label, desc in [
+            ("first_crack", "一爆判断偏晚", "听声复核，一爆起点比标记早约 10s，下批注意提前观察。"),
+            ("drop", "尾段火力过强", "出豆前豆温升率偏高，末段应再降火，避免豆表过烘。"),
+            ("yellow", "回黄正常", "变黄温度与时间符合本配方预期，可作为参考基准。"),
+        ]:
+            _seed_tag(cur, batch_ids[0], kind, label, desc, "li")
+            counts["tags"] += 1
         conn.commit()
     return counts
 
@@ -612,3 +635,88 @@ def update_note_status(
     note = get_note(nid)
     assert note is not None
     return note
+
+
+# ---------------- 阶段复盘标签（绑定事件版本快照） ----------------
+
+def _serialize_tag(row: dict[str, Any]) -> dict[str, Any]:
+    row["created_at"] = row["created_at"].isoformat()
+    return row
+
+
+def list_tags(bid: int, event_kind: str | None = None) -> list[dict[str, Any]]:
+    """列出批次标签，可按事件类型过滤。并标记当前事件是否已相对标签快照变更。"""
+    sql = (
+        "SELECT t.* FROM event_tags t WHERE t.batch_id=%s"
+    )
+    params: list[Any] = [bid]
+    if event_kind:
+        sql += " AND t.event_kind=%s"
+        params.append(event_kind)
+    sql += " ORDER BY t.created_at DESC, t.id DESC"
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        tags = [_serialize_tag(r) for r in cur.fetchall()]
+        # 当前有效事件
+        cur.execute(
+            "SELECT kind, id, t_s, source FROM events"
+            " WHERE batch_id=%s AND revoked_at IS NULL",
+            (bid,),
+        )
+        current = {r["kind"]: r for r in cur.fetchall()}
+    for t in tags:
+        cur_ev = current.get(t["event_kind"])
+        if cur_ev is None:
+            t["current_state"] = "event_missing"
+            t["current_event"] = None
+            t["changed"] = True
+        else:
+            t["current_event"] = {
+                "id": cur_ev["id"], "t_s": cur_ev["t_s"], "source": cur_ev["source"]
+            }
+            changed = (
+                cur_ev["id"] != t["bound_event_id"]
+                or float(cur_ev["t_s"]) != float(t["event_t_s"])
+            )
+            t["changed"] = changed
+            t["current_state"] = "changed" if changed else "current"
+    return tags
+
+
+def create_tag(
+    bid: int, event_kind: str, label: str, description: str | None, created_by: str
+) -> dict[str, Any]:
+    """为当前有效事件创建标签：保存当时事件 id/时间/来源作为快照。"""
+    valid = analytics.THERMAL_KINDS + ("damper", "gas")
+    if event_kind not in valid:
+        raise ValueError(f"event_kind 必须是 {valid} 之一")
+    if not label or not label.strip():
+        raise ValueError("标签内容不能为空")
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM events WHERE batch_id=%s AND kind=%s AND revoked_at IS NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (bid, event_kind),
+        )
+        ev = cur.fetchone()
+        if ev is None:
+            raise LookupError(f"批次没有已确认的 {event_kind} 事件，无法绑定标签")
+        cur.execute(
+            "INSERT INTO event_tags(batch_id, event_kind, label, description,"
+            " bound_event_id, event_t_s, event_source, created_by)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+            (bid, event_kind, label.strip(), description, ev["id"], ev["t_s"],
+             ev["source"], created_by),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    return _serialize_tag(dict(row))
+
+
+def delete_tag(tid: int) -> None:
+    """只删除标签本身；不触碰 events / event_revisions。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM event_tags WHERE id=%s", (tid,))
+        if cur.rowcount == 0:
+            raise KeyError("标签不存在")
+        conn.commit()
