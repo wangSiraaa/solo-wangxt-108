@@ -408,13 +408,23 @@ class TagIn(BaseModel):
     created_by: str = "operator"
 
 
+class TagStatusIn(BaseModel):
+    status: str
+    resolution: str | None = None
+    changed_by: str = "operator"
+
+
 @app.get("/api/batches/{bid}/tags")
-def list_tags(bid: int, event_kind: str | None = None) -> list[dict[str, Any]]:
+def list_tags(
+    bid: int, event_kind: str | None = None, status: str | None = None
+) -> list[dict[str, Any]]:
     if services.get_batch(bid) is None:
         raise HTTPException(404, "批次不存在")
     if event_kind is not None and event_kind not in analytics.THERMAL_KINDS + ("damper", "gas"):
         raise HTTPException(422, "event_kind 非法")
-    return services.list_tags(bid, event_kind)
+    if status is not None and status not in services.TAG_STATUSES:
+        raise HTTPException(422, f"status 必须是 {services.TAG_STATUSES} 之一")
+    return services.list_tags(bid, event_kind, status)
 
 
 @app.post("/api/batches/{bid}/tags")
@@ -431,13 +441,35 @@ def create_tag(bid: int, body: TagIn) -> dict[str, Any]:
         raise HTTPException(422, str(e)) from e
 
 
+@app.put("/api/batches/{bid}/tags/{tid}/status")
+def update_tag_status(bid: int, tid: int, body: TagStatusIn) -> dict[str, Any]:
+    tag = next((t for t in services.list_tags(bid) if t["id"] == tid), None)
+    if tag is None:
+        raise HTTPException(404, "该批次下没有此标签")
+    try:
+        return services.update_tag_status(tid, body.status, body.resolution, body.changed_by)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+
+
+@app.get("/api/batches/{bid}/tags/{tid}/revisions")
+def tag_revisions(bid: int, tid: int) -> list[dict[str, Any]]:
+    tag = next((t for t in services.list_tags(bid) if t["id"] == tid), None)
+    if tag is None:
+        raise HTTPException(404, "该批次下没有此标签")
+    return services.list_tag_revisions(tid)
+
+
 @app.delete("/api/batches/{bid}/tags/{tid}")
 def delete_tag(bid: int, tid: int) -> dict[str, Any]:
     tag = next((t for t in services.list_tags(bid) if t["id"] == tid), None)
     if tag is None:
         raise HTTPException(404, "该批次下没有此标签")
-    services.delete_tag(tid)  # 仅删除标签，不影响事件/修订
-    return {"deleted": tid, "events_unchanged": True, "revisions_unchanged": True}
+    services.delete_tag(tid)  # 级联删除标签处理历史；不影响事件/事件修订/比较/备注
+    return {"deleted": tid, "events_unchanged": True, "revisions_unchanged": True,
+            "tag_history_deleted": True}
 
 
 @app.get("/api/batches/{bid}/export")

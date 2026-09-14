@@ -70,7 +70,7 @@ def main():
         page.wait_for_timeout(500)
         blocks = tag_blocks(page)
         check("按变黄筛选只剩变黄标签", len(blocks) == 1 and "回黄正常" in blocks[0], str(blocks))
-        tags_card(page).locator(".filters button", has_text="全部").click()
+        tags_card(page).locator(".filters button", has_text="全部").nth(0).click()  # 事件行全部
         page.wait_for_timeout(400)
         page.screenshot(path=str(SHOTS / "15_tags_list.png"), full_page=True)
 

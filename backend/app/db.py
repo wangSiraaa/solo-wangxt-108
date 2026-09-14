@@ -163,7 +163,13 @@ CREATE TABLE IF NOT EXISTS event_tags (
                         (event_kind IN ('charge','turnaround','yellow','first_crack','drop','damper','gas')),
     label           TEXT NOT NULL,
     description     TEXT,
-    -- 创建时的事件版本快照
+    -- 处理闭环状态
+    status          TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open','adopted','ignored')),
+    resolution      TEXT,                    -- 最近一次处理结论
+    resolved_by     TEXT,                    -- 处理人
+    resolved_at     TIMESTAMPTZ,
+    -- 创建时的事件版本快照（处理流转永不修改这部分）
     bound_event_id  BIGINT REFERENCES events(id) ON DELETE SET NULL,
     event_t_s       DOUBLE PRECISION NOT NULL,   -- 标签创建时该事件的时间
     event_source    TEXT NOT NULL,              -- 标签创建时该事件的来源(auto/manual)
@@ -171,6 +177,24 @@ CREATE TABLE IF NOT EXISTS event_tags (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_tags_batch ON event_tags(batch_id, event_kind);
+
+-- 标签处理历史：只追加。删除标签时随之一并删除，不触碰事件/事件修订。
+CREATE TABLE IF NOT EXISTS tag_status_revisions (
+    id              BIGSERIAL PRIMARY KEY,
+    tag_id          BIGINT NOT NULL REFERENCES event_tags(id) ON DELETE CASCADE,
+    old_status      TEXT,                  -- NULL = 创建时的初始状态
+    new_status      TEXT NOT NULL CHECK (new_status IN ('open','adopted','ignored')),
+    resolution      TEXT,
+    changed_by      TEXT NOT NULL DEFAULT 'operator',
+    changed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tag_rev_tag ON tag_status_revisions(tag_id);
+
+-- 旧库补列（幂等）
+ALTER TABLE event_tags ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+ALTER TABLE event_tags ADD COLUMN IF NOT EXISTS resolution TEXT;
+ALTER TABLE event_tags ADD COLUMN IF NOT EXISTS resolved_by TEXT;
+ALTER TABLE event_tags ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
 """
 
 

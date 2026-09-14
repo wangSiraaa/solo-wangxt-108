@@ -17,8 +17,9 @@ def reseed(seed: int = 7) -> dict[str, int]:
     batch_ids: list[int] = []
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "TRUNCATE event_tags, note_status_revisions, comparison_notes, comparison_reports,"
-            " event_candidates, event_revisions, events, samples, batches RESTART IDENTITY"
+            "TRUNCATE tag_status_revisions, event_tags, note_status_revisions,"
+            " comparison_notes, comparison_reports, event_candidates, event_revisions,"
+            " events, samples, batches RESTART IDENTITY"
         )
         for pi, prof in enumerate(profiles):
             cur.execute(
@@ -137,27 +138,49 @@ def reseed(seed: int = 7) -> dict[str, int]:
             )
             counts["notes"] += 1
 
-        # 三条阶段复盘标签样例（批次1）：分别覆盖一爆、出豆、变黄，绑定创建时事件版本
-        def _seed_tag(cur, bid, kind, label, desc, by):
+        # 三条阶段复盘标签样例（批次1）：覆盖待处理/已采纳/已忽略，绑定创建时事件版本
+        def _seed_tag(cur, bid, kind, label, desc, by, status, resolution, resolved_by):
             cur.execute(
                 "SELECT id, t_s, source FROM events WHERE batch_id=%s AND kind=%s"
                 " AND revoked_at IS NULL ORDER BY id DESC LIMIT 1",
                 (bid, kind),
             )
             ev = cur.fetchone()
+            resolved_at = "now()" if status != "open" else "NULL"
             cur.execute(
-                "INSERT INTO event_tags(batch_id, event_kind, label, description,"
-                " bound_event_id, event_t_s, event_source, created_by)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                (bid, kind, label, desc, ev["id"], ev["t_s"], ev["source"], by),
+                "INSERT INTO event_tags(batch_id, event_kind, label, description, status,"
+                " resolution, resolved_by, resolved_at, bound_event_id, event_t_s, event_source, created_by)"
+                f" VALUES (%s,%s,%s,%s,%s,%s,%s,{resolved_at},%s,%s,%s,%s) RETURNING id",
+                (bid, kind, label, desc, status, resolution, resolved_by,
+                 ev["id"], ev["t_s"], ev["source"], by),
             )
+            tag_id = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO tag_status_revisions(tag_id, old_status, new_status, resolution, changed_by)"
+                " VALUES (%s,NULL,%s,%s,%s)",
+                (tag_id, status, resolution or "播种样例：初始状态", by),
+            )
+            if status != "open":
+                cur.execute(
+                    "INSERT INTO tag_status_revisions(tag_id, old_status, new_status, resolution, changed_by)"
+                    " VALUES (%s,'open',%s,%s,%s)",
+                    (tag_id, status, resolution, resolved_by),
+                )
 
-        for kind, label, desc in [
-            ("first_crack", "一爆判断偏晚", "听声复核，一爆起点比标记早约 10s，下批注意提前观察。"),
-            ("drop", "尾段火力过强", "出豆前豆温升率偏高，末段应再降火，避免豆表过烘。"),
-            ("yellow", "回黄正常", "变黄温度与时间符合本配方预期，可作为参考基准。"),
-        ]:
-            _seed_tag(cur, batch_ids[0], kind, label, desc, "li")
+        seed_tags = [
+            ("first_crack", "一爆判断偏晚",
+             "听声复核，一爆起点比标记早约 10s，下批注意提前观察。",
+             "open", None, "li"),
+            ("drop", "尾段火力过强",
+             "出豆前豆温升率偏高，末段应再降火，避免豆表过烘。",
+             "adopted", "已采纳：下一批出豆前 30s 再降燃气 10%。", "wang"),
+            ("yellow", "回黄正常",
+             "变黄温度与时间符合本配方预期，可作为参考基准。",
+             "ignored", "经验性备注，本批无需动作，标记为已忽略。", "li"),
+        ]
+        for kind, label, desc, status, resolution, by in seed_tags:
+            _seed_tag(cur, batch_ids[0], kind, label, desc, by,
+                      status, resolution, "li" if status == "open" else by)
             counts["tags"] += 1
         conn.commit()
     return counts
@@ -637,22 +660,31 @@ def update_note_status(
     return note
 
 
-# ---------------- 阶段复盘标签（绑定事件版本快照） ----------------
+# ---------------- 阶段复盘标签（绑定事件版本快照 + 处理闭环） ----------------
+
+TAG_STATUSES = ("open", "adopted", "ignored")
+TAG_STATUS_LABEL = {"open": "待处理", "adopted": "已采纳", "ignored": "已忽略"}
+
 
 def _serialize_tag(row: dict[str, Any]) -> dict[str, Any]:
     row["created_at"] = row["created_at"].isoformat()
+    if row.get("resolved_at") is not None:
+        row["resolved_at"] = row["resolved_at"].isoformat()
     return row
 
 
-def list_tags(bid: int, event_kind: str | None = None) -> list[dict[str, Any]]:
-    """列出批次标签，可按事件类型过滤。并标记当前事件是否已相对标签快照变更。"""
-    sql = (
-        "SELECT t.* FROM event_tags t WHERE t.batch_id=%s"
-    )
+def list_tags(
+    bid: int, event_kind: str | None = None, status: str | None = None
+) -> list[dict[str, Any]]:
+    """列出批次标签，可按事件类型与处理状态过滤。标记事件是否已相对标签快照变更。"""
+    sql = "SELECT t.* FROM event_tags t WHERE t.batch_id=%s"
     params: list[Any] = [bid]
     if event_kind:
         sql += " AND t.event_kind=%s"
         params.append(event_kind)
+    if status:
+        sql += " AND t.status=%s"
+        params.append(status)
     sql += " ORDER BY t.created_at DESC, t.id DESC"
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -664,6 +696,17 @@ def list_tags(bid: int, event_kind: str | None = None) -> list[dict[str, Any]]:
             (bid,),
         )
         current = {r["kind"]: r for r in cur.fetchall()}
+        # 每条标签的处理历史与最近一次处理
+        if tags:
+            cur.execute(
+                "SELECT * FROM tag_status_revisions WHERE tag_id = ANY(%s)"
+                " ORDER BY changed_at, id",
+                ([t["id"] for t in tags],),
+            )
+            history: dict[int, list[dict[str, Any]]] = {}
+            for r in cur.fetchall():
+                r["changed_at"] = r["changed_at"].isoformat()
+                history.setdefault(r["tag_id"], []).append(r)
     for t in tags:
         cur_ev = current.get(t["event_kind"])
         if cur_ev is None:
@@ -680,13 +723,18 @@ def list_tags(bid: int, event_kind: str | None = None) -> list[dict[str, Any]]:
             )
             t["changed"] = changed
             t["current_state"] = "changed" if changed else "current"
+        revs = history.get(t["id"], []) if tags else []
+        t["status_history"] = revs
+        # 最近一次“真正的处理”（排除 old_status 为 NULL 的创建行）
+        decisions = [r for r in revs if r["old_status"] is not None]
+        t["last_decision"] = decisions[-1] if decisions else None
     return tags
 
 
 def create_tag(
     bid: int, event_kind: str, label: str, description: str | None, created_by: str
 ) -> dict[str, Any]:
-    """为当前有效事件创建标签：保存当时事件 id/时间/来源作为快照。"""
+    """为当前有效事件创建标签：保存当时事件 id/时间/来源作为快照，初始状态待处理。"""
     valid = analytics.THERMAL_KINDS + ("damper", "gas")
     if event_kind not in valid:
         raise ValueError(f"event_kind 必须是 {valid} 之一")
@@ -702,19 +750,67 @@ def create_tag(
         if ev is None:
             raise LookupError(f"批次没有已确认的 {event_kind} 事件，无法绑定标签")
         cur.execute(
-            "INSERT INTO event_tags(batch_id, event_kind, label, description,"
+            "INSERT INTO event_tags(batch_id, event_kind, label, description, status,"
             " bound_event_id, event_t_s, event_source, created_by)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+            " VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s) RETURNING *",
             (bid, event_kind, label.strip(), description, ev["id"], ev["t_s"],
              ev["source"], created_by),
         )
-        row = cur.fetchone()
+        tid = cur.fetchone()["id"]
+        cur.execute(
+            "INSERT INTO tag_status_revisions(tag_id, old_status, new_status, resolution, changed_by)"
+            " VALUES (%s,NULL,'open','创建标签：初始待处理',%s)",
+            (tid, created_by),
+        )
         conn.commit()
-    return _serialize_tag(dict(row))
+    return next(t for t in list_tags(bid) if t["id"] == tid)
+
+
+def update_tag_status(
+    tid: int, new_status: str, resolution: str | None, changed_by: str
+) -> dict[str, Any]:
+    """追加一条处理历史并更新当前状态；不修改事件快照，也不触碰事件/事件修订。"""
+    if new_status not in TAG_STATUSES:
+        raise ValueError(f"status 必须是 {TAG_STATUSES} 之一")
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM event_tags WHERE id=%s FOR UPDATE", (tid,))
+        tag = cur.fetchone()
+        if tag is None:
+            raise KeyError("标签不存在")
+        old = tag["status"]
+        if old == new_status:
+            raise ValueError(f"标签已是「{TAG_STATUS_LABEL[new_status]}」状态，无需更新")
+        cur.execute(
+            "UPDATE event_tags SET status=%s, resolution=%s, resolved_by=%s, resolved_at=now()"
+            " WHERE id=%s",
+            (new_status, resolution, changed_by, tid),
+        )
+        cur.execute(
+            "INSERT INTO tag_status_revisions(tag_id, old_status, new_status, resolution, changed_by)"
+            " VALUES (%s,%s,%s,%s,%s)",
+            (tid, old, new_status,
+             resolution or f"状态由{TAG_STATUS_LABEL[old]}改为{TAG_STATUS_LABEL[new_status]}",
+             changed_by),
+        )
+        bid = tag["batch_id"]
+        conn.commit()
+    return next(t for t in list_tags(bid) if t["id"] == tid)
+
+
+def list_tag_revisions(tid: int) -> list[dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM tag_status_revisions WHERE tag_id=%s ORDER BY changed_at, id",
+            (tid,),
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        r["changed_at"] = r["changed_at"].isoformat()
+    return rows
 
 
 def delete_tag(tid: int) -> None:
-    """只删除标签本身；不触碰 events / event_revisions。"""
+    """删除标签及其处理历史；不触碰 events / event_revisions（标签历史由外键级联删除）。"""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM event_tags WHERE id=%s", (tid,))
         if cur.rowcount == 0:

@@ -68,13 +68,20 @@ export const api = {
       body: JSON.stringify(body)
     }).then(j),
   noteRevisions: (id) => fetch(`/api/notes/${id}/revisions`).then(j),
-  tags: (bid, eventKind) => fetch(`/api/batches/${bid}/tags${qs({ event_kind: eventKind })}`).then(j),
+  tags: (bid, p) => fetch(`/api/batches/${bid}/tags${qs(p)}`).then(j),
   createTag: (bid, body) =>
     fetch(`/api/batches/${bid}/tags`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body)
     }).then(j),
+  setTagStatus: (bid, tid, body) =>
+    fetch(`/api/batches/${bid}/tags/${tid}/status`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(j),
+  tagRevisions: (bid, tid) => fetch(`/api/batches/${bid}/tags/${tid}/revisions`).then(j),
   deleteTag: (bid, tid) => fetch(`/api/batches/${bid}/tags/${tid}`, { method: 'DELETE' }).then(j),
   exportUrl: (id, p) => `/api/batches/${id}/export${qs(p)}`,
   reseed: () => fetch('/api/admin/reseed?seed=7', { method: 'POST' }).then(j)
