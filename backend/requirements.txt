@@ -1,0 +1,8 @@
+# 后端 Python 依赖（实际版本取自 conda 环境 roast）
+numpy>=2.0
+fastapi>=0.115
+uvicorn[standard]>=0.30
+psycopg[binary]>=3.2
+pydantic>=2.8
+httpx>=0.27
+pytest>=8.0
