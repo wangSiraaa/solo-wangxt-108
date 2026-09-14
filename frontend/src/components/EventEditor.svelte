@@ -78,7 +78,7 @@
   <h3>事件标记（可人工修正，保留来源与历史）</h3>
   {#if err}<div class="err">{err}</div>{/if}
   <table>
-    <thead><tr><th>事件</th><th>时间 s</th><th>档位</th><th>来源</th><th></th></tr></thead>
+    <thead><tr><th>事件</th><th>时间 s</th><th>档位</th><th>来源</th><th>备注</th><th></th></tr></thead>
     <tbody>
       {#each thermal as e (e.id)}
         <tr>
@@ -86,6 +86,7 @@
           <td>{e.t_s}</td>
           <td>—</td>
           <td class:manual={e.source === 'manual'}>{e.source === 'manual' ? '人工' : '自动'}</td>
+          <td class="note">{e.note || ''}</td>
           <td><button disabled={busy} on:click={() => revise(e)}>修正</button></td>
         </tr>
       {/each}
@@ -95,6 +96,7 @@
           <td>{e.t_s}</td>
           <td>{e.value}</td>
           <td class:manual={e.source === 'manual'}>{e.source === 'manual' ? '人工' : '自动'}</td>
+          <td class="note">{e.note || ''}</td>
           <td><button disabled={busy} on:click={() => revise(e)}>修正</button></td>
         </tr>
       {/each}
@@ -142,6 +144,7 @@
   table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
   th, td { border-bottom: 1px solid #eee; padding: 4px 8px; text-align: left; }
   tr.op td { color: #7d6608; }
+  td.note { color:#666; max-width: 160px; font-size: 11.5px; }
   .manual { color: #c0392b; font-weight: 600; }
   .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   input, select { padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12.5px; }

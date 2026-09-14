@@ -168,6 +168,8 @@
   onMount(() => {
     chart = echarts.init(el);
     chart.setOption(option());
+    // 只读调试句柄，便于浏览器自动化校验双网格/系列，不参与任何渲染逻辑
+    if (typeof window !== 'undefined') window.__roastChart = chart;
     chart.on('click', (p2) => {
       const ev = p2?.data?._event;
       if (ev) dispatch('markclick', { event: ev });
