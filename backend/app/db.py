@@ -119,6 +119,41 @@ CREATE TABLE IF NOT EXISTS comparison_reports (
     created_by      TEXT NOT NULL DEFAULT 'operator',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 对比结论备注与待办：绑定创建时的批次对、对齐模式、计算参数与事件版本快照，
+-- 后续事件修正不改变既有备注所依据的快照。
+CREATE TABLE IF NOT EXISTS comparison_notes (
+    id              BIGSERIAL PRIMARY KEY,
+    batch_a_id      BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    batch_b_id      BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    alignment       TEXT NOT NULL CHECK (alignment IN ('physical','phase')),
+    smooth_window_s DOUBLE PRECISION NOT NULL,
+    ror_window_s    DOUBLE PRECISION NOT NULL,
+    conclusion      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'followup'
+                        CHECK (status IN ('followup','confirmed','discarded')),
+    owner           TEXT,
+    due_date        DATE,
+    event_version_a JSONB NOT NULL,   -- 创建时批次A有效事件快照
+    event_version_b JSONB NOT NULL,   -- 创建时批次B有效事件快照
+    anchor_snapshot JSONB,            -- 创建时锚点/可比性摘要（便于回溯结论依据）
+    created_by      TEXT NOT NULL DEFAULT 'operator',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notes_pair ON comparison_notes(batch_a_id, batch_b_id);
+
+-- 备注状态流转的审计轨迹：每次状态变更保留旧/新状态、原因、操作人、时间
+CREATE TABLE IF NOT EXISTS note_status_revisions (
+    id              BIGSERIAL PRIMARY KEY,
+    note_id         BIGINT NOT NULL REFERENCES comparison_notes(id) ON DELETE CASCADE,
+    old_status      TEXT,             -- NULL 表示创建时的初始状态
+    new_status      TEXT NOT NULL CHECK (new_status IN ('followup','confirmed','discarded')),
+    reason          TEXT,
+    changed_by      TEXT NOT NULL DEFAULT 'operator',
+    changed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_note_rev_note ON note_status_revisions(note_id);
 """
 
 

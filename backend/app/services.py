@@ -11,12 +11,14 @@ from .synth import build_profiles, generate_samples
 
 
 def reseed(seed: int = 7) -> dict[str, int]:
-    """删除旧数据并写入两批合成数据（原始采样 + auto 事件）。幂等。"""
+    """删除旧数据并写入合成批次（原始采样 + auto 事件 + 两条对比备注）。幂等。"""
     profiles = build_profiles()
-    counts = {"batches": 0, "samples": 0, "events": 0}
+    counts = {"batches": 0, "samples": 0, "events": 0, "notes": 0}
+    batch_ids: list[int] = []
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "TRUNCATE comparison_reports, event_candidates, event_revisions, events, samples, batches RESTART IDENTITY"
+            "TRUNCATE note_status_revisions, comparison_notes, comparison_reports,"
+            " event_candidates, event_revisions, events, samples, batches RESTART IDENTITY"
         )
         for pi, prof in enumerate(profiles):
             cur.execute(
@@ -34,6 +36,7 @@ def reseed(seed: int = 7) -> dict[str, int]:
                 ),
             )
             bid = cur.fetchone()["id"]
+            batch_ids.append(bid)
             counts["batches"] += 1
 
             rows = generate_samples(prof, seed=seed + pi)
@@ -70,6 +73,69 @@ def reseed(seed: int = 7) -> dict[str, int]:
                     (bid, g.t_s, g.value),
                 )
                 counts["events"] += 1
+
+        # 两条合成对比备注：相位对齐（待跟进）与物理对齐（已确认），均绑定当时事件版本
+        def _ev_versions(cur, bid):
+            cur.execute(
+                "SELECT id, kind, t_s, value, source, created_by, created_at"
+                " FROM events WHERE batch_id=%s AND revoked_at IS NULL ORDER BY t_s, id",
+                (bid,),
+            )
+            return [
+                {**r, "created_at": r["created_at"].isoformat()} for r in cur.fetchall()
+            ]
+
+        def _anchor_summary(cur, ba, bb):
+            cur.execute(
+                "SELECT kind, t_s FROM events WHERE batch_id=%s AND revoked_at IS NULL"
+                " AND kind IN ('charge','turnaround','yellow','first_crack','drop')",
+                (ba,),
+            )
+            aev = {r["kind"]: r["t_s"] for r in cur.fetchall()}
+            cur.execute(
+                "SELECT kind, t_s FROM events WHERE batch_id=%s AND revoked_at IS NULL"
+                " AND kind IN ('charge','turnaround','yellow','first_crack','drop')",
+                (bb,),
+            )
+            bev = {r["kind"]: r["t_s"] for r in cur.fetchall()}
+            common = [k for k in ("charge", "turnaround", "yellow", "first_crack", "drop")
+                      if k in aev and k in bev]
+            return {"anchors": common, "t_a": {k: aev[k] for k in common},
+                    "t_b": {k: bev[k] for k in common}}
+
+        id_a, id_b = batch_ids[0], batch_ids[1]
+        seed_notes = [
+            {
+                "alignment": "phase", "status": "followup",
+                "conclusion": ("相位对齐下两批发展段进度相近，但大锅量批次回温点→变黄真实用时更长，"
+                               "下批次尝试降低初火以缩短该段；待复测确认。"),
+                "owner": "zhang", "due": "2026-09-21", "by": "li",
+            },
+            {
+                "alignment": "physical", "status": "confirmed",
+                "conclusion": ("相同物理秒数（出豆前 120s）两批豆温差 <3℃，风门提前 40s 未造成明显温度偏移；"
+                               "本结论仅为描述性对比，不表示风门与温度的因果关系。"),
+                "owner": "wang", "due": None, "by": "li",
+            },
+        ]
+        for sn in seed_notes:
+            cur.execute(
+                "INSERT INTO comparison_notes(batch_a_id, batch_b_id, alignment,"
+                " smooth_window_s, ror_window_s, conclusion, status, owner, due_date,"
+                " event_version_a, event_version_b, anchor_snapshot, created_by)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (id_a, id_b, sn["alignment"], 21.0, 45.0, sn["conclusion"],
+                 sn["status"], sn["owner"], sn["due"],
+                 Jsonb(_ev_versions(cur, id_a)), Jsonb(_ev_versions(cur, id_b)),
+                 Jsonb(_anchor_summary(cur, id_a, id_b)), sn["by"]),
+            )
+            nid = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO note_status_revisions(note_id, old_status, new_status, reason, changed_by)"
+                " VALUES (%s,NULL,%s,'播种样例：初始状态',%s)",
+                (nid, sn["status"], sn["by"]),
+            )
+            counts["notes"] += 1
         conn.commit()
     return counts
 
@@ -399,3 +465,150 @@ def get_report(rid: int) -> dict[str, Any] | None:
     if row:
         row["created_at"] = row["created_at"].isoformat()
     return row
+
+
+# ---------------- 对比结论备注与待办 ----------------
+
+NOTE_STATUSES = ("followup", "confirmed", "discarded")
+NOTE_STATUS_LABEL = {"followup": "待跟进", "confirmed": "已确认", "discarded": "已废弃"}
+
+
+def _serialize_note(row: dict[str, Any]) -> dict[str, Any]:
+    row["created_at"] = row["created_at"].isoformat()
+    row["updated_at"] = row["updated_at"].isoformat()
+    if row.get("due_date") is not None:
+        row["due_date"] = row["due_date"].isoformat()
+    return row
+
+
+def list_notes(
+    bid: int | None = None,
+    other_id: int | None = None,
+    status: str | None = None,
+    include_pair_both_directions: bool = True,
+) -> list[dict[str, Any]]:
+    """列出备注。
+
+    bid 给定时返回“与该批次相关”的备注（不分 A/B 方向，便于批次详情页展示）；
+    同时给 other_id 时可限定为这一对批次。status 过滤状态。
+    """
+    sql = (
+        "SELECT n.*, ba.name AS batch_a_name, bb.name AS batch_b_name,"
+        " (SELECT count(*) FROM note_status_revisions r WHERE r.note_id=n.id) AS n_revisions"
+        " FROM comparison_notes n"
+        " JOIN batches ba ON ba.id=n.batch_a_id JOIN batches bb ON bb.id=n.batch_b_id"
+    )
+    where, params = [], []
+    if bid is not None:
+        if other_id is not None and include_pair_both_directions:
+            where.append(
+                "((n.batch_a_id=%s AND n.batch_b_id=%s)"
+                " OR (n.batch_a_id=%s AND n.batch_b_id=%s))"
+            )
+            params += [bid, other_id, other_id, bid]
+        elif other_id is not None:
+            where.append("n.batch_a_id=%s AND n.batch_b_id=%s")
+            params += [bid, other_id]
+        else:
+            where.append("(%s IN (n.batch_a_id, n.batch_b_id))")
+            params.append(bid)
+    if status:
+        where.append("n.status=%s")
+        params.append(status)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY n.created_at DESC, n.id DESC"
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return [_serialize_note(r) for r in rows]
+
+
+def get_note(nid: int) -> dict[str, Any] | None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT n.*, ba.name AS batch_a_name, bb.name AS batch_b_name"
+            " FROM comparison_notes n"
+            " JOIN batches ba ON ba.id=n.batch_a_id JOIN batches bb ON bb.id=n.batch_b_id"
+            " WHERE n.id=%s",
+            (nid,),
+        )
+        row = cur.fetchone()
+    return _serialize_note(row) if row else None
+
+
+def list_note_revisions(nid: int) -> list[dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM note_status_revisions WHERE note_id=%s ORDER BY changed_at, id",
+            (nid,),
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        r["changed_at"] = r["changed_at"].isoformat()
+    return rows
+
+
+def create_note(
+    bid_a: int, bid_b: int, alignment: str, smooth_window_s: float,
+    ror_window_s: float, conclusion: str, status: str, owner: str | None,
+    due_date: str | None, created_by: str, anchor_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """创建备注：同时快照两批当前有效事件版本，之后事件修正不影响本备注。"""
+    if alignment not in ("physical", "phase"):
+        raise ValueError("alignment 必须是 physical 或 phase")
+    if status not in NOTE_STATUSES:
+        raise ValueError(f"status 必须是 {NOTE_STATUSES} 之一")
+    if not conclusion or not conclusion.strip():
+        raise ValueError("结论内容不能为空")
+    va, vb = _event_version(bid_a), _event_version(bid_b)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO comparison_notes(batch_a_id, batch_b_id, alignment,"
+            " smooth_window_s, ror_window_s, conclusion, status, owner, due_date,"
+            " event_version_a, event_version_b, anchor_snapshot, created_by)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (bid_a, bid_b, alignment, float(smooth_window_s), float(ror_window_s),
+             conclusion.strip(), status, owner, due_date,
+             Jsonb(va), Jsonb(vb), Jsonb(anchor_snapshot or {}), created_by),
+        )
+        nid = cur.fetchone()["id"]
+        cur.execute(
+            "INSERT INTO note_status_revisions(note_id, old_status, new_status, reason, changed_by)"
+            " VALUES (%s,NULL,%s,'创建备注时的初始状态',%s)",
+            (nid, status, created_by),
+        )
+        conn.commit()
+    note = get_note(nid)
+    assert note is not None
+    return note
+
+
+def update_note_status(
+    nid: int, new_status: str, reason: str | None, changed_by: str
+) -> dict[str, Any]:
+    """更新备注状态：旧状态、原因、操作人写入审计轨迹；快照字段不变。"""
+    if new_status not in NOTE_STATUSES:
+        raise ValueError(f"status 必须是 {NOTE_STATUSES} 之一")
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM comparison_notes WHERE id=%s FOR UPDATE", (nid,))
+        row = cur.fetchone()
+        if row is None:
+            raise KeyError("备注不存在")
+        old = row["status"]
+        if old == new_status:
+            raise ValueError(f"备注已是 {NOTE_STATUS_LABEL[new_status]} 状态，无需更新")
+        cur.execute(
+            "UPDATE comparison_notes SET status=%s, updated_at=now() WHERE id=%s",
+            (new_status, nid),
+        )
+        cur.execute(
+            "INSERT INTO note_status_revisions(note_id, old_status, new_status, reason, changed_by)"
+            " VALUES (%s,%s,%s,%s,%s)",
+            (nid, old, new_status, reason or f"状态由{NOTE_STATUS_LABEL[old]}改为{NOTE_STATUS_LABEL[new_status]}",
+             changed_by),
+        )
+        conn.commit()
+    note = get_note(nid)
+    assert note is not None
+    return note

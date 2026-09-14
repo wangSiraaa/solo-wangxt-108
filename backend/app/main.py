@@ -79,6 +79,7 @@ def _build_detail(bid: int, params: ComputeParams) -> dict[str, Any]:
             "温升率为居中窗口派生量，窗口参数随结果给出；平滑不修改任何原始温度",
             "风门/燃气前后对比仅为描述性统计，不表示因果关系",
         ],
+        "notes": services.list_notes(bid=bid),
     }
 
 
@@ -171,6 +172,8 @@ def compare(
             for x in anchors
         ],
         "physical_table": align.physical_table(da, db),
+        # 与这一对批次相关的备注（含两种对齐模式），前端按当前模式过滤
+        "notes": services.list_notes(bid=a, other_id=b),
         "note": (
             "物理对齐=相同真实秒数；相位对齐=相同阶段进度，只是可视化归一化，不代表工艺等效。"
             "风门前后差异不构成因果结论。"
@@ -306,6 +309,93 @@ def get_report(rid: int) -> dict[str, Any]:
         "若这些事件此后被人工修正，当前批次视图会不同，但本报告快照不变。"
     )
     return row
+
+
+# ---------------- 对比结论备注与待办 ----------------
+
+class NoteIn(BaseModel):
+    a: int
+    b: int
+    alignment: str = "physical"
+    smooth_window_s: float | None = None
+    ror_window_s: float | None = None
+    conclusion: str = Field(min_length=1)
+    status: str = "followup"
+    owner: str | None = None
+    due_date: str | None = Field(None, description="截止日期 YYYY-MM-DD")
+    created_by: str = "operator"
+
+
+class NoteStatusIn(BaseModel):
+    status: str
+    reason: str | None = None
+    changed_by: str = "operator"
+
+
+def _note_anchor_summary(a: int, b: int) -> dict[str, Any]:
+    """创建备注时锚点/可比性的精简快照（完整事件版本另存）。"""
+    da, db = services.get_batch(a), services.get_batch(b)
+    ev_a, ev_b = services.load_events(a), services.load_events(b)
+    anchors, issues = align.build_anchors(ev_a, ev_b)
+    return {
+        "anchors": [
+            {"kind": x.kind, "t_a_s": x.ta, "t_b_s": x.tb} for x in anchors
+        ],
+        "issues": issues,
+        "comparability": align.comparability(da, db) if da and db else None,
+    }
+
+
+@app.get("/api/notes")
+def list_notes(
+    batch_id: int | None = None,
+    other_id: int | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    if status is not None and status not in services.NOTE_STATUSES:
+        raise HTTPException(422, f"status 必须是 {services.NOTE_STATUSES} 之一")
+    return services.list_notes(bid=batch_id, other_id=other_id, status=status)
+
+
+@app.post("/api/notes")
+def create_note(body: NoteIn) -> dict[str, Any]:
+    if services.get_batch(body.a) is None or services.get_batch(body.b) is None:
+        raise HTTPException(404, "批次不存在")
+    if body.alignment not in ("physical", "phase"):
+        raise HTTPException(422, "alignment 必须是 physical 或 phase")
+    params = _params(body.smooth_window_s, body.ror_window_s)
+    due = None
+    if body.due_date:
+        try:
+            from datetime import date
+            due = date.fromisoformat(body.due_date).isoformat()
+        except ValueError as e:
+            raise HTTPException(422, "due_date 必须是 YYYY-MM-DD") from e
+    try:
+        return services.create_note(
+            body.a, body.b, body.alignment, params.smooth_window_s,
+            params.ror_window_s, body.conclusion, body.status, body.owner,
+            due, body.created_by, anchor_snapshot=_note_anchor_summary(body.a, body.b),
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.put("/api/notes/{nid}/status")
+def update_note_status(nid: int, body: NoteStatusIn) -> dict[str, Any]:
+    try:
+        return services.update_note_status(nid, body.status, body.reason, body.changed_by)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+
+
+@app.get("/api/notes/{nid}/revisions")
+def note_revisions(nid: int) -> list[dict[str, Any]]:
+    if services.get_note(nid) is None:
+        raise HTTPException(404, "备注不存在")
+    return services.list_note_revisions(nid)
 
 
 @app.get("/api/batches/{bid}/export")

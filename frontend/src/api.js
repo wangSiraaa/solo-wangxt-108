@@ -54,6 +54,20 @@ export const api = {
     }).then(j),
   reports: () => fetch('/api/reports').then(j),
   report: (id) => fetch(`/api/reports/${id}`).then(j),
+  notes: (params) => fetch(`/api/notes${qs(params)}`).then(j),
+  createNote: (body) =>
+    fetch('/api/notes', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(j),
+  setNoteStatus: (id, body) =>
+    fetch(`/api/notes/${id}/status`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(j),
+  noteRevisions: (id) => fetch(`/api/notes/${id}/revisions`).then(j),
   exportUrl: (id, p) => `/api/batches/${id}/export${qs(p)}`,
   reseed: () => fetch('/api/admin/reseed?seed=7', { method: 'POST' }).then(j)
 };

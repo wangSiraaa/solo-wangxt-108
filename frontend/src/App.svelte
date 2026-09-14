@@ -7,6 +7,7 @@
   import MetricsPanel from './components/MetricsPanel.svelte';
   import ComparePanel from './components/ComparePanel.svelte';
   import CandidatePanel from './components/CandidatePanel.svelte';
+  import NotesPanel from './components/NotesPanel.svelte';
   import Legend from './components/Legend.svelte';
 
   let batches = [];
@@ -155,6 +156,7 @@
 
 {#if mode === 'compare' && compareData}
   <ComparePanel data={compareData} />
+  <NotesPanel aId={selA} bId={selB} {alignment} {smooth} {ror} />
 {/if}
 
 {#if chartData && mode === 'single'}
@@ -188,6 +190,7 @@
     <div class="stack">
       <EventEditor {detail} {revisions} on:revised={refresh} />
       <CandidatePanel batchId={detail.batch.id} onChange={refresh} />
+      <NotesPanel aId={detail.batch.id} />
     </div>
   </div>
 {/if}
