@@ -39,7 +39,7 @@ class RoastProfile:
     variety: str
     charge_g: float
     total_s: float
-    # 环境温度分段设定值（炉温目标），随燃气/风门调节缓慢响应
+    # 环境温度分段设定值（炉温目标折线），随燃气/风门施加小幅扰动
     env_setpoints: list[tuple[float, float]]  # (t_s, setpoint_c)
     gas: list[GasStep] = field(default_factory=list)
     dampers: list[DamperStep] = field(default_factory=list)
@@ -52,6 +52,12 @@ class RoastProfile:
     outage_windows: list[tuple[float, float]] = field(default_factory=list)
     jitter_sd: float = 0.35
     long_gap_every: int | None = None  # 每隔 N 个槽制造一次 4-7s 间隔
+    # 工艺/测量背景
+    recipe: str = "R-耶加-浅烘"
+    probe_position: str = "bean-bulk"        # bean-bulk(豆堆) / drum-wall(滚筒壁)
+    probe_offset_c: float = 0.0              # 已知系统性偏差（仅元数据）
+    missing_seeded_events: tuple[str, ...] = ()  # 播种时故意不创建的已确认事件
+    seed_note: str = ""
 
 
 def _step_value(steps: list[tuple[float, float]] | list, t: float) -> float:
@@ -65,7 +71,13 @@ def _step_value(steps: list[tuple[float, float]] | list, t: float) -> float:
 
 
 def build_profiles() -> list[RoastProfile]:
-    """两条可对比的批次：B 段燃气/风门策略不同，但都为合成数据。"""
+    """四批合成数据，用于核对分段对齐的各种边界：
+
+    A / B      同配方、相近锅量、豆堆探针（基础对比）
+    C          同配方、大锅量(1600g)，且**一爆标记缺失**（事件不全，只能前缀对齐）
+    D          同豆同配方、锅量与 A 相近，但**探针装在滚筒壁**(drum-wall)+系统偏差，
+               用于核对“探针位置不同→温度水平不可直接比”。
+    """
     p1 = RoastProfile(
         name="B2026-0914-A",
         variety="Ethiopia Yirgacheffe",
@@ -87,6 +99,7 @@ def build_profiles() -> list[RoastProfile]:
             "drop": 700.0,
         },
         outage_windows=[(140, 154)],   # 14s 缺口：在插值允许范围内
+        seed_note="基准批次：豆堆探针，1200g",
     )
     p2 = RoastProfile(
         name="B2026-0914-B",
@@ -109,8 +122,50 @@ def build_profiles() -> list[RoastProfile]:
         },
         outage_windows=[(200, 232)],  # 32s 缺口：超过插值上限，必须只标注不插值
         bean_noise_sd=1.1,
+        seed_note="对照批次：豆堆探针，1180g，风门更早更温和",
     )
-    return [p1, p2]
+    p3 = RoastProfile(
+        name="B2026-0914-C-bigcharge",
+        variety="Ethiopia Yirgacheffe",
+        charge_g=1600.0,                 # 大锅量，热响应更慢
+        total_s=780.0,
+        env_setpoints=[(0, 190), (320, 208), (620, 226), (760, 233)],
+        gas=[GasStep(0, 90), GasStep(320, 78), GasStep(600, 62)],
+        dampers=[DamperStep(0, 30), DamperStep(320, 55), DamperStep(640, 80)],
+        true_events={
+            "charge": 0.0,
+            "turnaround": 96.0,
+            "yellow": 342.0,
+            "first_crack": 642.0,   # 真值存在，但播种时故意不创建该标记
+            "drop": 760.0,
+        },
+        outage_windows=[(420, 430)],
+        bean_noise_sd=0.9,
+        missing_seeded_events=("first_crack",),  # 操作员尚未确认一爆
+        seed_note="大锅量1600g，一爆标记缺失：只能对齐到变黄，之后保持真实时间",
+    )
+    p4 = RoastProfile(
+        name="B2026-0914-D-wallprobe",
+        variety="Ethiopia Yirgacheffe",
+        charge_g=1210.0,
+        total_s=710.0,
+        env_setpoints=[(0, 188), (300, 206), (560, 223), (690, 231)],
+        gas=[GasStep(0, 84), GasStep(300, 70), GasStep(550, 56)],
+        dampers=[DamperStep(0, 30), DamperStep(300, 54), DamperStep(590, 78)],
+        true_events={
+            "charge": 0.0,
+            "turnaround": 84.0,
+            "yellow": 303.0,
+            "first_crack": 566.0,
+            "drop": 690.0,
+        },
+        outage_windows=[(140, 153)],
+        probe_position="drum-wall",   # 探针位置不同：读数温度水平偏高，不可与豆堆探针直接比
+        probe_offset_c=2.0,           # 另含 +2℃ 系统偏差
+        bean_noise_sd=1.4,
+        seed_note="滚筒壁探针+2℃偏差：温度水平不可直接比，RoR 形态可参考",
+    )
+    return [p1, p2, p3, p4]
 
 
 def _simulate_curve(profile: RoastProfile) -> tuple[np.ndarray, np.ndarray]:
@@ -131,8 +186,10 @@ def _simulate_curve(profile: RoastProfile) -> tuple[np.ndarray, np.ndarray]:
     env[0] = float(profile.env_setpoints[0][1])
     bean[0] = 22.0
     tau_env = 25.0
-    tau_bean = 24.0
-    fc = profile.true_events["first_crack"]
+    # 锅量影响热响应：豆量越大升温越慢（仅合成模型的定性模拟，非真实物理常数）
+    mass_factor = (profile.charge_g / 1200.0) ** 0.35
+    tau_bean = 24.0 * mass_factor
+    fc = profile.true_events["first_crack"] if "first_crack" in profile.true_events else profile.total_s * 0.82
 
     pts_t = np.array([p[0] for p in profile.env_setpoints], dtype=float)
     pts_v = np.array([p[1] for p in profile.env_setpoints], dtype=float)
@@ -149,6 +206,11 @@ def _simulate_curve(profile: RoastProfile) -> tuple[np.ndarray, np.ndarray]:
         latent = 3.0 * math.exp(-0.5 * ((ts - (fc - 35)) / 30.0) ** 2)
         bean[i] = bean[i - 1] + (env[i - 1] - bean[i - 1]) / tau_bean - latent / 60.0
 
+    # 探针位置不同 → 读数温度水平不同（不是豆温本身的差异）。
+    # 滚筒壁探针读数介于豆温与炉温之间、偏高且噪声更大；系统性偏差只作用于观测真值。
+    if profile.probe_position == "drum-wall":
+        bean = 0.42 * env + 0.58 * bean
+    bean = bean + profile.probe_offset_c
     return bean, env
 
 

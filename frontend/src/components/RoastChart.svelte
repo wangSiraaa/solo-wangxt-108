@@ -113,6 +113,9 @@
     const marks = [];
     const bands = [];
     let p;
+    if (!data) {
+      return { animation: false, series: [], xAxis: [], yAxis: [], grid: [] };
+    }
     if (data.a && data.b) {
       p = data.params;
       series.push(...buildSeries(data.a, COLORS_A, ` ${data.a.batch.name.slice(-1)}`, 0));

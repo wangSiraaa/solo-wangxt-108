@@ -23,11 +23,19 @@ CREATE TABLE IF NOT EXISTS batches (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
     variety         TEXT,
+    recipe          TEXT,                                 -- 配方标识：同配方不同锅量才有对齐比较意义
     charge_g        DOUBLE PRECISION NOT NULL,          -- 投豆量 g（元数据，不参与曲线计算）
+    probe_position  TEXT NOT NULL DEFAULT 'bean-bulk',    -- 探针安装位置（不同位置的温度水平不可直接比）
+    probe_offset_c  DOUBLE PRECISION NOT NULL DEFAULT 0,  -- 已知系统性读数偏差（仅元数据，不改原始值）
     started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     note            TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 旧库补列（幂等）
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS recipe TEXT;
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS probe_position TEXT NOT NULL DEFAULT 'bean-bulk';
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS probe_offset_c DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS samples (
     id              BIGSERIAL PRIMARY KEY,
@@ -76,6 +84,40 @@ CREATE TABLE IF NOT EXISTS event_revisions (
     reason          TEXT,
     revised_by      TEXT NOT NULL DEFAULT 'operator',
     revised_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 候选修订：负责人对疑似误标建立的“建议”，不改变当前有效事件，需确认才生效
+CREATE TABLE IF NOT EXISTS event_candidates (
+    id              BIGSERIAL PRIMARY KEY,
+    batch_id        BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    proposed_t_s    DOUBLE PRECISION NOT NULL,
+    proposed_value  DOUBLE PRECISION,
+    reason          TEXT,
+    status          TEXT NOT NULL DEFAULT 'proposed'
+                        CHECK (status IN ('proposed','accepted','rejected')),
+    proposed_by     TEXT NOT NULL DEFAULT 'operator',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at      TIMESTAMPTZ
+);
+
+-- 比较报告：创建时快照两批次各自的“事件版本集”，旧报告永久绑定旧事件版本，
+-- 之后事件再被修正也不改变已存报告的结论。
+CREATE TABLE IF NOT EXISTS comparison_reports (
+    id              BIGSERIAL PRIMARY KEY,
+    batch_a_id      BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    batch_b_id      BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    alignment       TEXT NOT NULL DEFAULT 'physical'
+                        CHECK (alignment IN ('physical','phase')),
+    smooth_window_s DOUBLE PRECISION NOT NULL,
+    ror_window_s    DOUBLE PRECISION NOT NULL,
+    -- 快照：事件版本（含来源）、指标、对齐/可比性信息、派生曲线（可直接重放）
+    snapshot        JSONB NOT NULL,
+    event_version_a JSONB NOT NULL,
+    event_version_b JSONB NOT NULL,
+    note            TEXT,
+    created_by      TEXT NOT NULL DEFAULT 'operator',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 

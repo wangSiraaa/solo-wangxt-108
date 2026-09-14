@@ -28,7 +28,7 @@ def client():
 
 def test_synthetic_feed_has_noise_gaps_and_uniformity(client):
     rows = services.list_batches()
-    assert len(rows) == 2
+    assert len(rows) == 4  # A/B 基础、C 大锅量缺一爆、D 滚筒壁探针
     ids = [r["id"] for r in rows]
 
     for bid in ids:

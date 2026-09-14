@@ -18,3 +18,7 @@ __pycache__/
 pgdata/
 backend/exports/
 *.log
+
+# Local browser-verification evidence and package cache
+browser_shots/
+conda-pkgs/

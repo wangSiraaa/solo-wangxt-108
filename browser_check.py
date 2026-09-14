@@ -191,16 +191,14 @@ def main():
         check("两块指标面板(A/B)", body.count("阶段指标") == 2)
         page.screenshot(path=str(SHOTS / "2_compare.png"), full_page=True)
 
-        # 切换 A/B 选择（把 A 设为批次2，B 设为批次1）
-        bids = page.evaluate(
-            "() => [...document.querySelectorAll('label')].find(l=>l.textContent.includes('批次A')).querySelector('select')"
-        )
-        id1, id2 = page.evaluate(
+        # 切换 A/B 选择（把 A 设为批次2，再切回批次1）
+        ids = page.evaluate(
             """() => {
                 const s=[...document.querySelectorAll('label')].find(l=>l.textContent.includes('批次A')).querySelector('select');
                 return [...s.options].map(o=>o.value);
             }"""
         )
+        id1, id2 = ids[0], ids[1]
         reqs.clear()
         select_by_label(page, "批次A", id2)
         wait_req(reqs, "/api/compare")

@@ -33,6 +33,27 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body)
     }).then(j),
+  candidates: (bid) => fetch(`/api/batches/${bid}/candidates`).then(j),
+  proposeCandidate: (bid, body) =>
+    fetch(`/api/batches/${bid}/candidates`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(j),
+  decideCandidate: (cid, accept, by = 'operator') =>
+    fetch(`/api/candidates/${cid}/decision`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ accept, decided_by: by })
+    }).then(j),
+  createReport: (body) =>
+    fetch('/api/reports', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(j),
+  reports: () => fetch('/api/reports').then(j),
+  report: (id) => fetch(`/api/reports/${id}`).then(j),
   exportUrl: (id, p) => `/api/batches/${id}/export${qs(p)}`,
   reseed: () => fetch('/api/admin/reseed?seed=7', { method: 'POST' }).then(j)
 };

@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from . import analytics, services
+from . import alignment as align
 from .analytics import ComputeParams
 from .config import settings
 from .db import init_schema
@@ -143,15 +144,168 @@ def compare(
     b: int,
     smooth_window_s: float | None = None,
     ror_window_s: float | None = None,
+    alignment: str = "physical",
 ) -> dict[str, Any]:
+    """双批次比较。
+
+    alignment=physical：两批各自下豆点为 t=0 的真实时间叠加（回答“相同物理时长”）。
+    alignment=phase：在共同、有序、已确认事件锚点间做分段线性对齐（回答“相同阶段进度”）。
+        事件缺失/顺序矛盾时只对齐共同前缀，不拉伸整条曲线；RoR 仅位置重映射，不在变形轴求导。
+    """
+    if alignment not in ("physical", "phase"):
+        raise HTTPException(422, "alignment 必须是 physical 或 phase")
     params = _params(smooth_window_s, ror_window_s)
-    return {
+    da, db = _build_detail(a, params), _build_detail(b, params)
+    cmp_info = align.comparability(da["batch"], db["batch"])
+    anchors, issues = align.build_anchors(da["events"], db["events"])
+
+    payload: dict[str, Any] = {
         "params": params.as_dict(),
-        "time_reference": "两个批次的时间轴均以各自下豆点(charge)为 0，直接对齐",
-        "a": _build_detail(a, params),
-        "b": _build_detail(b, params),
-        "note": "双批次叠加仅用于目视比较；风门前后差异不构成因果结论",
+        "alignment_requested": alignment,
+        "a": da,
+        "b": db,
+        "comparability": cmp_info,
+        "anchor_issues": issues,
+        "anchors": [
+            {"kind": x.kind, "label": x.label, "t_a_s": x.ta, "t_b_s": x.tb}
+            for x in anchors
+        ],
+        "physical_table": align.physical_table(da, db),
+        "note": (
+            "物理对齐=相同真实秒数；相位对齐=相同阶段进度，只是可视化归一化，不代表工艺等效。"
+            "风门前后差异不构成因果结论。"
+        ),
     }
+    if alignment == "phase":
+        if not anchors:
+            payload["phase"] = {
+                "available": False,
+                "reason": "没有任何共同锚点（可能缺下豆点），无法分段对齐；请先确认事件或建立候选修订",
+            }
+        else:
+            phase_series = align.build_phase_series(da, db, anchors)
+            payload["phase"] = {
+                "available": True,
+                "version": align.ALIGN_VERSION,
+                "canonical_anchors": phase_series["canonical_anchors"],
+                "segments": phase_series["segments"],
+                "phase_table": align.phase_table(da, db, anchors, phase_series["canonical"]),
+                "series": {
+                    k: v for k, v in phase_series.items()
+                    if k not in ("canonical", "canonical_anchors", "segments")
+                },
+                "coverage": _phase_coverage(anchors, da, db),
+                "ror_rule": "RoR 取自 analytics 在真实时间上的差分结果，相位视图只移动其横坐标，绝不沿变形时间重新求导",
+                "not_equivalence": (
+                    "分段对齐把阶段速度差异归一化掉了；真实快慢请看 segments 的 a/b 时长与 physical_table，"
+                    "对齐本身不构成工艺等效"
+                ),
+            }
+    return payload
+
+
+def _phase_coverage(anchors, da, db) -> dict[str, Any]:
+    """相位对齐覆盖范围；共同锚点之外保持真实时间、不拉伸。"""
+    first = anchors[0]
+    last = anchors[-1]
+    return {
+        "aligned_real_range_a_s": [first.ta, last.ta],
+        "aligned_real_range_b_s": [first.tb, last.tb],
+        "tail_unaligned": (
+            "共同锚点仅覆盖到 " + last.label + "；其后的尾段（如出豆）若只一侧有标记，"
+            "保持各自真实时间，不在相位视图中强行拉伸"
+            if last.kind != "drop" else "全段（下豆→出豆）均在共同锚点内"
+        ),
+    }
+
+
+class CandidateIn(BaseModel):
+    kind: str
+    proposed_t_s: float = Field(ge=0)
+    proposed_value: float | None = Field(None, ge=0, le=100)
+    reason: str | None = None
+    proposed_by: str = "operator"
+
+
+class CandidateDecisionIn(BaseModel):
+    accept: bool
+    decided_by: str = "operator"
+
+
+@app.get("/api/batches/{bid}/candidates")
+def list_candidates(bid: int, status: str | None = None) -> list[dict[str, Any]]:
+    if services.get_batch(bid) is None:
+        raise HTTPException(404, "批次不存在")
+    return services.list_candidates(bid, status)
+
+
+@app.post("/api/batches/{bid}/candidates")
+def create_candidate(bid: int, body: CandidateIn) -> dict[str, Any]:
+    if services.get_batch(bid) is None:
+        raise HTTPException(404, "批次不存在")
+    try:
+        return services.create_candidate(
+            bid, body.kind, body.proposed_t_s, body.reason,
+            body.proposed_by, body.proposed_value,
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@app.post("/api/candidates/{cid}/decision")
+def decide_candidate(cid: int, body: CandidateDecisionIn) -> dict[str, Any]:
+    """接受候选会落成一次正式人工修正（产生事件新版本+审计行）；拒绝只改候选状态。"""
+    try:
+        return services.decide_candidate(cid, body.accept, body.decided_by)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+
+
+class ReportIn(BaseModel):
+    a: int
+    b: int
+    alignment: str = "physical"
+    smooth_window_s: float | None = None
+    ror_window_s: float | None = None
+    note: str | None = None
+    created_by: str = "operator"
+
+
+@app.post("/api/reports")
+def create_report(body: ReportIn) -> dict[str, Any]:
+    """把当前比较（含当时两侧事件版本）固化为报告；之后事件再修正也不影响本报告。"""
+    if services.get_batch(body.a) is None or services.get_batch(body.b) is None:
+        raise HTTPException(404, "批次不存在")
+    params = _params(body.smooth_window_s, body.ror_window_s)
+    snapshot = compare(body.a, body.b, params.smooth_window_s,
+                       params.ror_window_s, body.alignment)
+    # 报告快照不必回传体积大的原始数组之外的内容；这里保留完整以便重放
+    row = services.create_report(
+        body.a, body.b, body.alignment, params.smooth_window_s,
+        params.ror_window_s, snapshot, body.created_by, body.note,
+    )
+    return {"report_id": row["id"], "created_at": row["created_at"],
+            "bound_event_version_a": row["event_version_a"],
+            "bound_event_version_b": row["event_version_b"]}
+
+
+@app.get("/api/reports")
+def list_reports() -> list[dict[str, Any]]:
+    return services.list_reports()
+
+
+@app.get("/api/reports/{rid}")
+def get_report(rid: int) -> dict[str, Any]:
+    row = services.get_report(rid)
+    if row is None:
+        raise HTTPException(404, "报告不存在")
+    row["binding_warning"] = (
+        "本报告永久绑定创建时两侧的事件版本(event_version_a/b)；"
+        "若这些事件此后被人工修正，当前批次视图会不同，但本报告快照不变。"
+    )
+    return row
 
 
 @app.get("/api/batches/{bid}/export")
